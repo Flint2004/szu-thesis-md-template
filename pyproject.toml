@@ -1,0 +1,11 @@
+[project]
+name = "szu-thesis-md-template"
+version = "0.1.0"
+description = "SZU Undergraduate Thesis Template (Markdown) — 深圳大学本科毕业论文 Markdown 模板，pandoc 转 docx 流水线"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "pypandoc-binary>=1.17",
+    "python-docx>=1.2.0",
+]
