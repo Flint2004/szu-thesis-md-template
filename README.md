@@ -3,6 +3,38 @@
 深圳大学本科毕业论文 **Markdown 模板** + pandoc + python-docx 后处理流水线。
 用 markdown 写正文，`uv run python scripts/build.py` 一键产出符合深大格式要求的 `.docx`。
 
+## 写在前面
+
+> 本模板的设计目标是把"调格式"这件事尽量从写作流程中剥离，**但它远非完美**。深大规范本身也
+有歧义与学院特殊要求，自动化永远不可能百分百覆盖。
+>
+> **强烈建议**与 AI 协作者（Claude Code / Cursor / Codex 等）搭配 `skills/` 里的
+操作指南一起使用，`skills/` 里每份文件都是**给 AI 读的作业手册**，约定了本项目特定的写法与调试路径，避免 AI 自由发挥。
+>
+> 效果见 `release/`，内有直出 Word 文档、简单处理后生成的 PDF 版本。
+> 
+> *Flint Ting @ SZU* --- 2026.04
+
+## 免责声明
+
+> **请勿直接提交自动生成的 `build/thesis.docx`。** 自动化只解决绝大部分的机械排版，以下
+> 事项**必须由作者人工完成**：
+>
+> 1. **论文撰写**
+> 2. 打开 docx 后 **Ctrl/Cmd+A → F9** 更新目录、页码、交叉引用字段
+> 3. **逐张检查图片**：缩放、对齐、分辨率、图注是否与图内容一致
+> 4. **逐段核对参考文献**：GB/T 7714-2015 格式、作者署名顺序、卷期页码
+> 5. 打印前在**学院最新官方模板**上套版一次（封面、诚信声明的字段位置、排版）
+> 6. 学院/教师对格式如有**补充要求**以其最新通知为准
+> 7. 准备其他毕业设计材料
+> 8. 掌握正确与导师沟通的方式
+> 9. ⑨
+>
+> 本项目**与深圳大学无任何官方关联**，输出结果不代表深圳大学立场。
+>
+> `thesis/` 下的示例内容是纯虚构作品，**不代表任何个人观点**；
+> 参考文献、实验数据、人物姓名均为模板演示用途，请勿引用。
+
 ## 为什么不用 Word 直接写
 
 - markdown 纯文本：可版本控制、可 grep、可 diff、可并行多人协作
@@ -15,8 +47,10 @@
 ```bash
 # 前置：安装 uv（https://docs.astral.sh/uv/）
 uv sync                                    # 安装依赖（含 pandoc 二进制）
-uv run python scripts/make_reference_docx.py   # 生成样式参考文档（仅首次）
-uv run python scripts/build.py              # 写完 markdown 后重复这一步
+uv run python scripts/build.py             # 构建；首次会自动生成 reference.docx
+
+# 草稿阶段不想带封面 + 诚信声明两页：
+uv run python scripts/build.py --no-cover
 ```
 
 产物在 `build/thesis.docx`。打开后按一次 Ctrl+A、F9 可更新目录/页码。
@@ -25,6 +59,7 @@ uv run python scripts/build.py              # 写完 markdown 后重复这一步
 
 ```
 ├── thesis/                 # 正文 markdown（按顺序拼接）
+│   ├── _info.md            #   作者信息（YAML frontmatter；注入封面和诚信声明）
 │   ├── 00_frontmatter.md   #   目录占位 + 中文摘要 + 关键词
 │   ├── 01_intro.md         #   第 1 章
 │   ├── 02_related.md       #   第 2 章
@@ -36,12 +71,18 @@ uv run python scripts/build.py              # 写完 markdown 后重复这一步
 │   ├── 08_ack.md           #   致谢
 │   ├── 09_abstract_en.md   #   英文摘要 + 关键词
 │   └── 10_appendix.md      #   附录（证明等）
+├── templates/              # 封面 / 诚信声明 docx 模板，含 {{key}} 占位符
+│   ├── cover.docx          #   深大毕设封面
+│   └── honor.docx          #   深大诚信声明（签名+日期空白供手写）
 ├── figures/                # 图片文件
-├── build/                  # 构建产物（docx、合并后的 md、reference.docx）
+├── skills/                 # 给 Claude / 协作者的操作指南（见下）
 ├── scripts/
 │   ├── build.py            #   主流水线：合并 md → pandoc → 后处理 docx
-│   └── make_reference_docx.py   # 生成 reference.docx 样式源
-├── skills/                 # 给 Claude / 协作者的操作指南（见下）
+│   ├── make_reference_docx.py   # reference.docx 样式源生成器（build 时自动调用）
+│   └── fix_quotes.py       #   一键把直引号转中文引号（safe 保护代码/数学/转义）
+├── build/                  # 构建产物（docx、合并后的 md、reference.docx）。.gitignore
+├── release/                # 公开发布产物（docx / pdf），git-tracked
+├── LICENSE                 # MIT
 ├── pyproject.toml
 └── README.md
 ```
@@ -247,7 +288,7 @@ $$L_0(f) \leq \hat{L}_\gamma(f) + \frac{4}{\gamma}\hat{\mathfrak{R}}_S$$
 
 - `scripts/build.py` 顶部常量：bookmark 命名、图片宽度、悬挂缩进参数
 - `scripts/make_reference_docx.py`：默认字体/字号/页脚
-- `skills/`：给 AI 协作者（Claude Code / Cursor / Aider）的操作指南
+- `skills/`：给 AI 协作者（Claude Code / Cursor / Codex）的操作指南
 
 ## License
 

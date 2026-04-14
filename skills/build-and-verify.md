@@ -110,8 +110,63 @@ def _my_new_rule(doc: Document) -> int:
     return fixed
 ```
 
-## 调试技巧
+## 调试 docx：先解包看 XML
 
-- 打开 `build/thesis.docx.extract/word/document.xml` 直接看 OOXML（先 `unzip build/thesis.docx -d build/extracted`）
-- 针对特定段落看 pPr / rPr：`grep -A2 "特定文本" build/extracted/word/document.xml`
-- python-docx 不识别的 pStyle 用 `_raw_pstyle(para)` 读原值
+**每次遇到样式/排版异常，第一反应不是改 `build.py`，而是解包 docx 看
+真实的 OOXML 结构。** 这是本项目最重要的调试习惯——python-docx 的抽象
+有不少陷阱（`style.name` 会 fallback、`doc.paragraphs` 不含表格内段），
+只看抽象层会猜错根因。
+
+### 常用命令
+
+```bash
+# 解包到临时目录
+rm -rf /tmp/extract && mkdir /tmp/extract
+unzip -q build/thesis.docx -d /tmp/extract
+ls /tmp/extract/word/              # document.xml / footer1.xml / styles.xml / ...
+
+# 不落地直接看
+unzip -p build/thesis.docx word/document.xml | less
+unzip -p build/thesis.docx word/styles.xml | grep -A3 'w:styleId="Heading1"'
+
+# 查某段文字附近的 pPr/rPr
+python3 -c "
+import re
+x = open('/tmp/extract/word/document.xml').read()
+i = x.find('特定中文关键字')
+if i > 0:
+    start = max(x.rfind('<w:p ', 0, i), x.rfind('<w:p>', 0, i))
+    end = x.find('</w:p>', i) + 6
+    print(x[start:end])
+"
+```
+
+### 对比参考稿
+
+若用户给了"改好的 docx"作为目标样式：
+
+```bash
+# 解包参考稿
+unzip -q /path/to/reference.docx -d /tmp/ref
+# 对比同一段落的 XML（比如 H1 第3章）
+diff <(python3 extract_para.py /tmp/extract/word/document.xml "第3章") \
+     <(python3 extract_para.py /tmp/ref/word/document.xml "第3章")
+```
+
+把差异的 attribute / child element 直接抄到 post-process 代码里（黑体/颜色
+/ind/sz 等）——这比猜规范更准，也能匹配教师/学院的特殊要求。
+
+### 写新规则前的"先看后写"清单
+
+- [ ] 解包目标 docx，grep 定位问题段的 XML 片段
+- [ ] 找该段的 `pStyle val`（区分 pandoc 默认 `Normal` fallback 与真实值）
+- [ ] 看它依赖哪个样式（解 `styles.xml` 找同名 style 定义）
+- [ ] 看它的 `pPr` / `rPr` 实际写了什么（可能被 reference.docx 继承）
+- [ ] 再写代码改它
+
+### 其它快捷调试
+
+- `_raw_pstyle(para)`：python-docx 抽象层读不到真 pStyle 时用这个
+- `grep -c 'w:hyperlink' /tmp/extract/word/document.xml`：统计元素式超链接
+- `grep -oE 'bookmarkStart[^/]*name="[^"]*"' /tmp/extract/word/document.xml | sort -u`：列出所有书签
+- 改完 `build.py` 再跑 build，重复解包 diff 前后差异来验证

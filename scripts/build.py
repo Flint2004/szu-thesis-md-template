@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 from pathlib import Path
 
@@ -33,7 +34,11 @@ ROOT = Path(__file__).resolve().parent.parent
 THESIS_DIR = ROOT / "thesis"
 FIGURES_DIR = ROOT / "figures"
 BUILD_DIR = ROOT / "build"
+TEMPLATES_DIR = ROOT / "templates"
 REFERENCE_DOCX = BUILD_DIR / "reference.docx"
+COVER_DOCX = TEMPLATES_DIR / "cover.docx"
+HONOR_DOCX = TEMPLATES_DIR / "honor.docx"
+INFO_MD = THESIS_DIR / "_info.md"
 OUTPUT_DOCX = BUILD_DIR / "thesis.docx"
 MERGED_MD = BUILD_DIR / "thesis.md"
 
@@ -114,6 +119,29 @@ def _unescape_quotes(text: str) -> str:
     return ESCAPED_QUOTE_RE.sub(r"\1", text)
 
 
+def load_info() -> dict:
+    """读 thesis/_info.md 的 YAML frontmatter，返回 {key: str}。
+
+    纯手写轻量级解析器：只支持简单的 `key: "value"` 行，不引入 PyYAML。
+    缺失时返回空 dict（模板占位符保持原样）。
+    """
+    if not INFO_MD.exists():
+        return {}
+    raw = INFO_MD.read_text(encoding="utf-8")
+    m = re.match(r"^---\n(.*?)\n---", raw, re.DOTALL)
+    if not m:
+        return {}
+    info: dict[str, str] = {}
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m2 = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*"?(.*?)"?\s*$', line)
+        if m2:
+            info[m2.group(1)] = m2.group(2)
+    return info
+
+
 def merge_markdown() -> Path:
     BUILD_DIR.mkdir(exist_ok=True)
     parts: list[str] = []
@@ -137,7 +165,22 @@ def merge_markdown() -> Path:
 # ===========================================================================
 
 
+def _ensure_reference_docx() -> None:
+    """reference.docx 缺失时自动调用 make_reference_docx.py 生成。"""
+    if REFERENCE_DOCX.exists():
+        return
+    print(f"[auto]  build/reference.docx 不存在，自动生成…")
+    # 延迟 import 避免循环依赖；脚本同在 scripts/ 下
+    import importlib.util
+    mrd_path = Path(__file__).parent / "make_reference_docx.py"
+    spec = importlib.util.spec_from_file_location("_mrd", mrd_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.main()
+
+
 def convert_to_docx(merged_md: Path) -> Path:
+    _ensure_reference_docx()
     extra_args = [
         f"--resource-path={FIGURES_DIR}:{THESIS_DIR}:{ROOT}",
         "--standalone",
@@ -472,6 +515,214 @@ def _add_page_breaks_before_h1(doc: Document) -> int:
             p._element.insert(0, new_r)
         inserted += 1
     return inserted
+
+
+def _add_empty_footer_part(doc: Document) -> str:
+    """给 docx 添加一个空 footer XML part，返回 document 级 relationship id。
+
+    用于给封面+诚信声明 section 套"无页码"页脚。
+    """
+    from docx.opc.constants import CONTENT_TYPE, RELATIONSHIP_TYPE as RT
+    from docx.opc.part import Part
+    from docx.opc.packuri import PackURI
+
+    idx = 1
+    existing = {p.partname for p in doc.part.package.iter_parts()}
+    while True:
+        uri = PackURI(f"/word/footer_cover{idx}.xml")
+        if uri not in existing:
+            break
+        idx += 1
+
+    footer_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        b'<w:p><w:pPr><w:pStyle w:val="Footer"/></w:pPr></w:p>'
+        b"</w:ftr>"
+    )
+    footer_part = Part(uri, CONTENT_TYPE.WML_FOOTER, footer_xml, doc.part.package)
+    rel_id = doc.part.relate_to(footer_part, RT.FOOTER)
+    return rel_id
+
+
+PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+# WPS/Word 常把同一占位符按字体差异拆成多个 run；允许 `{{`、key、`}}` 之间夹
+# `</w:t>...<w:t>` 片段（可能跨 `</w:r><w:r>` 边界）。
+_RUN_SPLIT = r"(?:</w:t>(?:(?!</w:t>|<w:t[^>]*>).)*?<w:t[^>]*>)"
+_NORMALIZE_RE = re.compile(
+    rf"\{{\{{({_RUN_SPLIT})?\s*([A-Za-z_][A-Za-z0-9_]*)\s*({_RUN_SPLIT})?\}}\}}",
+    re.DOTALL,
+)
+
+
+def _xml_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _fill_placeholders_xml(xml: str, info: dict) -> tuple[str, int]:
+    """直接在 document.xml 字符串层替换 `{{key}}`，保留所有原始 run 样式。
+
+    - Step 1：把跨 run 拆分的占位符（`{{</w:t></w:r>...<w:t>key</w:t>...<w:t>}}`）
+      规整回单 run 形式 `{{key}}`，期间吸收首尾 run 的 `</w:t>...<w:t>` 边界
+    - Step 2：简单字符串替换 `{{key}}` → XML 转义后的 value
+    - 不通过 python-docx 段落 API，不做 run 合并或清空，保留表格内所有样式
+    """
+    xml = _NORMALIZE_RE.sub(lambda m: "{{" + m.group(2) + "}}", xml)
+    count = 0
+
+    def repl(m: re.Match[str]) -> str:
+        nonlocal count
+        key = m.group(1)
+        if key in info:
+            count += 1
+            return _xml_escape(info[key])
+        return m.group(0)
+
+    xml = PLACEHOLDER_RE.sub(repl, xml)
+    return xml, count
+
+
+def _read_docx_body_xml(docx_path: Path) -> str:
+    import zipfile
+    with zipfile.ZipFile(docx_path, "r") as z:
+        return z.read("word/document.xml").decode("utf-8")
+
+
+def _force_no_indent_lxml(p_elem) -> None:
+    """给 lxml 的 w:p 元素强制 ind=0（覆盖 thesis.docx Normal 样式继承的首行缩进）。"""
+    from lxml import etree
+    pPr = p_elem.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = etree.SubElement(p_elem, qn("w:pPr"))
+        p_elem.insert(0, pPr)
+    ind = pPr.find(qn("w:ind"))
+    if ind is None:
+        ind = etree.SubElement(pPr, qn("w:ind"))
+    for k in ("w:left", "w:leftChars", "w:firstLine", "w:firstLineChars"):
+        ind.set(qn(k), "0")
+
+
+def _parse_body_children(doc_xml: str) -> list:
+    """解析 document.xml 字符串，返回 body 下所有 w:p / w:tbl 元素。
+
+    - 过滤 textutil/WPS 残留的 `PAGE` 纯文本段
+    - 表格单元格内的 w:p 强制清零缩进（封面字段要顶格，避免被 Normal 的
+      2 字符首行缩进污染）；顶层 w:p 保持原样，让诚信声明的正文段自然
+      继承首行缩进
+    """
+    from lxml import etree
+    tree = etree.fromstring(doc_xml.encode("utf-8"))
+    body = tree.find(qn("w:body"))
+    if body is None:
+        return []
+    results = []
+    for child in body:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag not in ("p", "tbl"):
+            continue
+        if tag == "p":
+            text = "".join(t.text or "" for t in child.iter(qn("w:t"))).strip()
+            if text in {"PAGE", "PAGE  ", "PAGE\xa0"}:
+                continue
+            # 顶层 p 不动 ind，让其沿用 Normal 的 2 字符首行缩进（诚信声明正文需要）
+        else:
+            # 表格：只对单元格内的 w:p 清零缩进（封面字段顶格）
+            for p in child.iter(qn("w:p")):
+                _force_no_indent_lxml(p)
+        results.append(child)
+    return results
+
+
+def _prepend_cover_and_honor(doc: Document, info: dict | None = None) -> int:
+    """在 thesis.docx 开头插入封面 + 诚信声明，独占 section 不显示页码。
+
+    要求：
+    - `templates/cover.docx` 与 `templates/honor.docx` 存在
+    - 两文件的 body 为 Normal 样式段落（不会被 TOC 收录）
+    - 页脚中的 PAGE 文本（textutil 转换时的残留）被过滤
+    - 封面与诚信声明之间加 page break；诚信声明后加 section break (nextPage)
+    - 新 section 的 sectPr 引用刚创建的空 footer part，实现"无页码"
+
+    返回复制的顶层元素数（0 表示未找到模板，跳过）。
+    """
+    from copy import deepcopy
+
+    if not (COVER_DOCX.exists() and HONOR_DOCX.exists()):
+        return 0
+
+    # XML 级读取 + 替换（保留表格/多 run 原始格式）
+    cover_xml = _read_docx_body_xml(COVER_DOCX)
+    honor_xml = _read_docx_body_xml(HONOR_DOCX)
+    if info:
+        cover_xml, _ = _fill_placeholders_xml(cover_xml, info)
+        honor_xml, _ = _fill_placeholders_xml(honor_xml, info)
+    cover_children = _parse_body_children(cover_xml)
+    honor_children = _parse_body_children(honor_xml)
+
+    main_body = doc.element.body
+
+    # 定位 main body 首个 <w:p>/<w:tbl> 元素（作为插入锚点）
+    first_content = None
+    for child in main_body:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag in ("p", "tbl", "sdt"):
+            first_content = child
+            break
+    if first_content is None:
+        return 0
+
+    prefix: list = []
+
+    # 1. 封面
+    prefix.extend(deepcopy(c) for c in cover_children)
+
+    # 2. 封面与诚信声明之间的 page break 段
+    pb_p = OxmlElement("w:p")
+    pb_r = OxmlElement("w:r")
+    pb_br = OxmlElement("w:br")
+    pb_br.set(qn("w:type"), "page")
+    pb_r.append(pb_br)
+    pb_p.append(pb_r)
+    prefix.append(pb_p)
+
+    # 3. 诚信声明
+    prefix.extend(deepcopy(c) for c in honor_children)
+
+    # 4. section break 段，sectPr 引用空 footer（无页码）
+    empty_footer_rid = _add_empty_footer_part(doc)
+
+    final_sectPr = main_body.find(qn("w:sectPr"))
+    sb_p = OxmlElement("w:p")
+    sb_pPr = OxmlElement("w:pPr")
+    sb_sectPr = OxmlElement("w:sectPr")
+
+    # 空 footerReference（覆盖默认继承的 footer1，防止显示 PAGE）
+    foot_ref = OxmlElement("w:footerReference")
+    foot_ref.set(qn("w:type"), "default")
+    foot_ref.set(qn("r:id"), empty_footer_rid)
+    sb_sectPr.append(foot_ref)
+
+    if final_sectPr is not None:
+        for tag in ("w:pgSz", "w:pgMar", "w:cols", "w:docGrid"):
+            el = final_sectPr.find(qn(tag))
+            if el is not None:
+                sb_sectPr.append(deepcopy(el))
+
+    # 页码类型：可选，不设置页码格式即可；为清晰起见显式 start=0（隐藏 PAGE 若存在）
+    sb_type = OxmlElement("w:type")
+    sb_type.set(qn("w:val"), "nextPage")
+    sb_sectPr.append(sb_type)
+
+    sb_pPr.append(sb_sectPr)
+    sb_p.append(sb_pPr)
+    prefix.append(sb_p)
+
+    # 插入到 first_content 之前（按原顺序，addprevious 每次在 first_content 前面紧邻位置插入）
+    for elem in prefix:
+        first_content.addprevious(elem)
+
+    return len(prefix)
 
 
 def _setup_section_pagenum(doc: Document) -> int:
@@ -965,7 +1216,8 @@ def _style_custom_blocks(doc: Document) -> tuple[int, int, int]:
 # ===========================================================================
 
 
-def post_process_docx(path: Path) -> None:
+def post_process_docx(path: Path, *, with_cover: bool = True,
+                      info: dict | None = None) -> None:
     doc = Document(str(path))
 
     toc_inserted = False
@@ -1038,11 +1290,16 @@ def post_process_docx(path: Path) -> None:
     # OMML 数字直立
     upright = _upright_math_numbers(doc)
 
+    # 最后：封面 + 诚信声明——放在所有正文美化之后，
+    # 这样封面里的布局表格、WPS 原始字体/对齐不会被 _beautify_tables 等改动
+    cover_elems = _prepend_cover_and_honor(doc, info) if with_cover else 0
+
     doc.save(str(path))
     print(
         f"[post] toc={toc_inserted} bookmarks={bookmarks_added} centered={centered}\n"
         f"       h1={h1_fixed} h2={h2_fixed} h3={h3_fixed} refs_h={refs_h} "
-        f"acks_h={acks_h} hidden_h1={hidden} pbreaks={pbreaks} sect={sect_changes}\n"
+        f"acks_h={acks_h} hidden_h1={hidden} pbreaks={pbreaks} sect={sect_changes} "
+        f"cover_elems={cover_elems}\n"
         f"       toc_title={toc_t} title_cn={ttl_cn} title_en={ttl_en} "
         f"abstract={abstract_fixed} refs_entries={refs_entries}\n"
         f"       captions={captions_fixed} pics_resized={pics_fixed} "
@@ -1056,11 +1313,22 @@ def post_process_docx(path: Path) -> None:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description="Build thesis.docx from markdown.")
+    ap.add_argument(
+        "--no-cover", action="store_true",
+        help="跳过封面和诚信声明两页（draft 草稿阶段常用）",
+    )
+    args = ap.parse_args()
+
+    info = load_info() if not args.no_cover else {}
+    if info:
+        print(f"[info]  -> {len(info)} 个字段 from thesis/_info.md")
+
     merged = merge_markdown()
     print(f"[merge] -> {merged}")
     out = convert_to_docx(merged)
     print(f"[docx]  -> {out}")
-    post_process_docx(out)
+    post_process_docx(out, with_cover=not args.no_cover, info=info)
     print(f"[done]  -> {out}")
 
 

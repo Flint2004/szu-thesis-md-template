@@ -45,3 +45,7 @@ thesis-draft/
 drafts/
 *_draft.md
 *.bak
+
+# 内部 NOTES / TODO（不入仓库）
+NOTES.md
+TODO.md
